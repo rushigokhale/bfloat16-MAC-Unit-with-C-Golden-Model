@@ -1,0 +1,155 @@
+// Golden (reference) model for the bf16 MAC. Pure C++, exact integer arithmetic.
+// Written independently of the RTL algorithm: exact value -> single rounding.
+//
+// value of a finite nonzero operand = (-1)^sign * m * 2^e   (m is an integer)
+#pragma once
+#include <cstdint>
+#include <cstring>
+#include <cmath>
+
+namespace ref {
+
+constexpr uint32_t QNAN = 0x7FC00000u;
+constexpr uint32_t INF_BITS = 0x7F800000u;
+
+inline float    u2f(uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; }
+inline uint32_t f2u(float f)    { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+
+// ---- bf16 helpers (used by tests, not by the MAC model itself) -------------
+inline float bf16_to_float(uint16_t x) { return u2f((uint32_t)x << 16); }
+inline uint16_t float_to_bf16_rne(float f) {
+    uint32_t u = f2u(f);
+    if ((u & 0x7F800000u) == 0x7F800000u) {                 // inf / nan
+        if (u & 0x007FFFFFu) return 0x7FC0;                 // nan
+        return (uint16_t)(u >> 16);
+    }
+    uint32_t lsb = (u >> 16) & 1;
+    u += 0x7FFFu + lsb;                                     // round to nearest even
+    return (uint16_t)(u >> 16);
+}
+
+enum Kind { ZERO, NORMAL, INF, NAN_ };
+struct Num { Kind kind; bool sign; unsigned __int128 m; int e; };
+
+inline Num unpack_bf16(uint16_t x) {
+    bool s = x >> 15; int ex = (x >> 7) & 0xFF; unsigned fr = x & 0x7F;
+    if (ex == 0xFF) return { fr ? NAN_ : INF, s, 0, 0 };
+    if (ex == 0)    return { ZERO, s, 0, 0 };               // DAZ
+    return { NORMAL, s, (unsigned)(0x80 | fr), ex - 127 - 7 };
+}
+inline Num unpack_fp32(uint32_t x) {
+    bool s = x >> 31; int ex = (x >> 23) & 0xFF; uint32_t fr = x & 0x7FFFFF;
+    if (ex == 0xFF) return { fr ? NAN_ : INF, s, 0, 0 };
+    if (ex == 0)    return { ZERO, s, 0, 0 };               // DAZ
+    return { NORMAL, s, (uint32_t)(0x800000 | fr), ex - 127 - 23 };
+}
+
+// Side information about what happened inside the operation. Used only for
+// functional coverage; the pass/fail check compares `bits` only.
+struct Flags {
+    bool special = false;        // handled by NaN/inf/zero rules, no arithmetic
+    bool inexact = false, tie = false, round_up = false, round_carry = false;
+    bool underflow_flush = false, overflow = false, exact_cancel = false;
+    bool eff_sub = false;        // effective subtraction of magnitudes
+    bool has_exp_diff = false;   // true when both product and acc are nonzero finite
+    int  exp_diff = 0;           // product exponent - acc exponent
+    int  norm_shift = 0;         // how far the leading one fell below the larger operand's
+};
+struct Result { uint32_t bits; Flags f; };
+
+inline int top_bit(unsigned __int128 v) {                   // v != 0
+    int p = 0;
+    while (v >>= 1) ++p;
+    return p;
+}
+inline uint32_t pack_inf(bool s)  { return (s ? 0x80000000u : 0u) | INF_BITS; }
+inline uint32_t pack_zero(bool s) { return s ? 0x80000000u : 0u; }
+
+inline Result mac(uint16_t a, uint16_t b, uint32_t c) {
+    Result R; R.bits = 0;
+    Num A = unpack_bf16(a), B = unpack_bf16(b), C = unpack_fp32(c);
+    bool ps = A.sign ^ B.sign;
+
+    // ---- special values ---------------------------------------------------
+    if (A.kind == NAN_ || B.kind == NAN_ || C.kind == NAN_) { R.bits = QNAN; R.f.special = true; return R; }
+    bool aInf = A.kind == INF, bInf = B.kind == INF;
+    if ((aInf && B.kind == ZERO) || (A.kind == ZERO && bInf)) { R.bits = QNAN; R.f.special = true; return R; }
+    if (aInf || bInf) {
+        R.f.special = true;
+        R.bits = (C.kind == INF && C.sign != ps) ? QNAN : pack_inf(ps);
+        return R;
+    }
+    if (C.kind == INF) { R.bits = pack_inf(C.sign); R.f.special = true; return R; }
+
+    // ---- finite operands: exact product ------------------------------------
+    Num P;
+    if (A.kind == ZERO || B.kind == ZERO) P = { ZERO, ps, 0, 0 };
+    else P = { NORMAL, ps, A.m * B.m, A.e + B.e };           // exact, <= 16 bits
+
+    if (P.kind == ZERO && C.kind == ZERO) {                  // zero + zero
+        R.bits = pack_zero(P.sign && C.sign);
+        R.f.special = true;
+        return R;
+    }
+
+    // ---- exact sum  S * 2^E -----------------------------------------------
+    __int128 S; int E;
+    if (P.kind == ZERO)      { S = (__int128)C.m; if (C.sign) S = -S; E = C.e; }
+    else if (C.kind == ZERO) { S = (__int128)P.m; if (P.sign) S = -S; E = P.e; }
+    else {
+        const Num &big = (P.e >= C.e) ? P : C;
+        const Num &sml = (P.e >= C.e) ? C : P;
+        int d = big.e - sml.e;
+        R.f.has_exp_diff = true;
+        R.f.exp_diff = (P.e + top_bit(P.m)) - (C.e + top_bit(C.m));
+        R.f.eff_sub = (P.sign != C.sign);
+        if (d > 100) {
+            // The smaller operand is far below half an ulp of the result precision
+            // (more than 2^76 times smaller), so it cannot change a nearest-even result.
+            S = (__int128)big.m; if (big.sign) S = -S; E = big.e;
+        } else {
+            __int128 bv = (__int128)(big.m << d); if (big.sign) bv = -bv;
+            __int128 sv = (__int128)sml.m;        if (sml.sign) sv = -sv;
+            S = bv + sv; E = sml.e;
+        }
+    }
+
+    if (S == 0) { R.bits = pack_zero(false); R.f.exact_cancel = true; return R; }  // exact cancel -> +0
+
+    bool sign = S < 0;
+    unsigned __int128 mag = (unsigned __int128)(sign ? -S : S);
+    int p  = top_bit(mag);
+    int ue = p + E;                                           // exponent of the leading one
+    uint32_t q;
+    if (p > 23) {
+        int sh = p - 23;
+        unsigned __int128 qq   = mag >> sh;
+        unsigned __int128 rem  = mag & (((unsigned __int128)1 << sh) - 1);
+        unsigned __int128 half = (unsigned __int128)1 << (sh - 1);
+        R.f.inexact = rem != 0;
+        R.f.tie = (rem == half);
+        bool up = rem > half || (rem == half && (qq & 1));
+        R.f.round_up = up;
+        if (up) ++qq;
+        if (qq == ((unsigned __int128)1 << 24)) { qq >>= 1; ++ue; R.f.round_carry = true; }
+        q = (uint32_t)qq;
+    } else {
+        q = (uint32_t)(mag << (23 - p));
+    }
+    // how far did the leading one fall relative to the larger input's leading one?
+    if (P.kind != ZERO && C.kind != ZERO) {
+        int top_p = P.e + top_bit(P.m), top_c = C.e + top_bit(C.m);
+        int top_max = top_p > top_c ? top_p : top_c;
+        R.f.norm_shift = top_max - (p + E);                  // > 0 cancellation, < 0 carry out of the add (before rounding)
+    }
+
+    int biased = ue + 127;
+    if (biased >= 255) { R.bits = pack_inf(sign);  R.f.overflow = true; return R; }
+    if (biased <= 0)   { R.bits = pack_zero(sign); R.f.underflow_flush = true; return R; }
+    R.bits = ((uint32_t)sign << 31) | ((uint32_t)biased << 23) | (q & 0x7FFFFF);
+    return R;
+}
+
+inline uint32_t mac_bits(uint16_t a, uint16_t b, uint32_t c) { return mac(a, b, c).bits; }
+
+}  // namespace ref
