@@ -1,0 +1,136 @@
+// N x N weight-stationary systolic array of bf16_mac processing elements.
+//
+//   * W[r][c] (bf16) is stored in each PE (loaded through the write port).
+//   * Activation x[r] flows left -> right along row r.
+//   * Partial sums flow top -> bottom down each column:  psum(r,c) = psum(r-1,c) + x[r]*W[r][c]
+//   * y[c] = (((0 + x0*W0c) + x1*W1c) + ... )   (fp32, one bf16_mac rounding per step)
+//
+// The MAC has a fixed latency of L=3, so:
+//   row r input is delayed by L*r   (input skew)
+//   activations move one PE to the right every L cycles
+//   column c output is delayed by L*(N-1-c)   (output de-skew)
+// Total latency from x_valid to y_valid: 6N-3 cycles.
+//
+// Optional bug injection (mutation testing): BUG_ARR_SKEW, BUG_ARR_TRANSPOSE
+module bf16_systolic_delay #(
+    parameter int W = 1,
+    parameter int D = 1
+) (
+    input  logic         clk,
+    input  logic         rst_n,
+    input  logic [W-1:0] d,
+    output logic [W-1:0] q
+);
+    generate
+        if (D == 0) begin : g_wire
+            assign q = d;
+            /* verilator lint_off UNUSEDSIGNAL */
+            logic unused_clk_rst = clk ^ rst_n;
+            /* verilator lint_on UNUSEDSIGNAL */
+        end else begin : g_regs
+            logic [W-1:0] sr [D];
+            always_ff @(posedge clk) begin
+                if (!rst_n) begin
+                    for (int i = 0; i < D; i++) sr[i] <= '0;
+                end else begin
+                    sr[0] <= d;
+                    for (int i = 1; i < D; i++) sr[i] <= sr[i-1];
+                end
+            end
+            assign q = sr[D-1];
+        end
+    endgenerate
+endmodule
+
+module bf16_systolic #(
+    parameter int N = 4
+) (
+    input  logic                     clk,
+    input  logic                     rst_n,
+    // weight write port
+    input  logic                     w_we,
+    input  logic [$clog2(N)-1:0]     w_row,
+    input  logic [$clog2(N)-1:0]     w_col,
+    input  logic [15:0]              w_data,
+    // activation vector in
+    input  logic                     x_valid,
+    input  logic [15:0]              x_in  [N],
+    // result vector out
+    output logic                     y_valid,
+    output logic [31:0]              y_out [N]
+);
+    localparam int L = 3;                                    // bf16_mac latency
+
+    // ---- weights ----
+    logic [15:0] wgt [N][N];
+    always_ff @(posedge clk) begin
+        if (w_we) wgt[w_row][w_col] <= w_data;
+    end
+
+    // ---- row input skew: row r delayed by L*r (valid travels with data) ----
+    logic [15:0] x_sk  [N];
+    logic        xv_sk [N];
+    for (genvar r = 0; r < N; r++) begin : g_skew
+`ifdef BUG_ARR_SKEW
+        localparam int SK = (r == 0) ? 0 : (L * r - 1);       // BUG: wrong skew
+`else
+        localparam int SK = L * r;
+`endif
+        logic [16:0] q;
+        bf16_systolic_delay #(.W(17), .D(SK)) u_dly (
+            .clk(clk), .rst_n(rst_n), .d({x_valid, x_in[r]}), .q(q));
+        assign x_sk[r]  = q[15:0];
+        assign xv_sk[r] = q[16];
+    end
+
+    // ---- PE grid ----
+    logic [15:0] xh  [N][N];                                  // activation at PE input
+    logic        xhv [N][N];
+    logic [31:0] ps  [N][N];                                  // PE output (partial sum)
+    logic        pv  [N][N];
+
+    for (genvar r = 0; r < N; r++) begin : g_row
+        for (genvar c = 0; c < N; c++) begin : g_col
+            if (c == 0) begin : g_first
+                assign xh[r][0]  = x_sk[r];
+                assign xhv[r][0] = xv_sk[r];
+            end else begin : g_next
+                logic [16:0] q;
+                bf16_systolic_delay #(.W(17), .D(L)) u_hdly (
+                    .clk(clk), .rst_n(rst_n), .d({xhv[r][c-1], xh[r][c-1]}), .q(q));
+                assign xh[r][c]  = q[15:0];
+                assign xhv[r][c] = q[16];
+            end
+
+            logic [31:0] acc_in;
+            if (r == 0) begin : g_top
+                assign acc_in = 32'h0000_0000;                // +0
+            end else begin : g_mid
+                assign acc_in = ps[r-1][c];
+            end
+
+            logic [15:0] wsel;
+`ifdef BUG_ARR_TRANSPOSE
+            assign wsel = wgt[c][r];                          // BUG: transposed weights
+`else
+            assign wsel = wgt[r][c];
+`endif
+
+            bf16_mac u_mac (
+                .clk(clk), .rst_n(rst_n),
+                .in_valid(xhv[r][c]), .a(xh[r][c]), .b(wsel), .acc(acc_in),
+                .out_valid(pv[r][c]), .result(ps[r][c]));
+        end
+    end
+
+    // ---- column output de-skew: column c delayed by L*(N-1-c) ----
+    logic        yv_col [N];
+    for (genvar c = 0; c < N; c++) begin : g_out
+        logic [32:0] q;
+        bf16_systolic_delay #(.W(33), .D(L * (N - 1 - c))) u_odly (
+            .clk(clk), .rst_n(rst_n), .d({pv[N-1][c], ps[N-1][c]}), .q(q));
+        assign y_out[c]  = q[31:0];
+        assign yv_col[c] = q[32];
+    end
+    assign y_valid = yv_col[0];                               // all columns are valid together
+endmodule
