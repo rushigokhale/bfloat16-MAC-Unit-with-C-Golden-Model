@@ -1,0 +1,178 @@
+// Testbench for bf16_mac (Verilator, C++).
+//
+//   stimulus (stimulus.h) --> driver --> DUT (mac_top) --> monitor --> scoreboard
+//                        \--> golden model (model/bf16_mac_model.h) ----^
+//
+// Checks per result: exact 32-bit value vs golden model, and exact latency.
+// SVA in mac_checker.sv checks protocol invariants on top of that.
+//
+// Plusargs:  +seed=N  +ops=N (random ops, default 400000)  +quiet  +skipdirected  +covverbose
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <string>
+#include "Vmac_top.h"
+#include "verilated.h"
+#if VM_COVERAGE
+#include "verilated_cov.h"
+#endif
+#include "../model/bf16_mac_model.h"
+#include "stimulus.h"
+#include "coverage.h"
+
+static const int LATENCY = 3;
+
+struct Pending { Op op; ref::Result exp; uint64_t tag; const char* label; };
+
+class Env {
+public:
+    Env(Vmac_top* t, Rng& r) : top(t), rng(r) { covdef::declare_all(cov); }
+
+    // ---- one clock cycle: drive inputs, rising edge, monitor outputs --------
+    void cycle(bool valid, const Op& o, const char* label) {
+        top->clk = 0; top->in_valid = valid; top->a = o.a; top->b = o.b; top->acc = o.c;
+        top->eval();
+        top->clk = 1; top->eval();
+        ++edge_no;
+        if (valid) {
+            Pending p{ o, ref::mac(o.a, o.b, o.c), edge_no, label };
+            q.push_back(p);
+            covdef::sample(cov, o.a, o.b, o.c, p.exp);
+        }
+        monitor();
+        // pipeline-flow coverage
+        if (valid) { run_len++; if (gap_len) gap_len = 0; }
+        else { if (run_len >= 8) cov.hit("pipeline", "gap_after_run"); if (run_len == 1) cov.hit("pipeline", "isolated_op"); run_len = 0; gap_len++; }
+        if (run_len == 8) cov.hit("pipeline", "back_to_back_run>=8");
+    }
+    void idle() { Op junk{ (uint16_t)rng.u32(), (uint16_t)rng.u32(), rng.u32() }; cycle(false, junk, "idle"); }
+    void drain() { for (int i = 0; i < LATENCY + 2; i++) idle(); }
+
+    // ---- scoreboard --------------------------------------------------------
+    void monitor() {
+        uint64_t due = edge_no - (LATENCY - 1);              // tag of the op whose result is visible now
+        bool expect_valid = !q.empty() && q.front().tag == due;
+        if (top->out_valid != (expect_valid ? 1 : 0)) {
+            fail_report("VALID", nullptr, 0);
+            if (top->out_valid && !q.empty() && q.front().tag < due) q.pop_front();
+            return;
+        }
+        if (!expect_valid) return;
+        Pending p = q.front(); q.pop_front();
+        checked++;
+        if (top->result != p.exp.bits) fail_report("DATA", &p, top->result);
+    }
+    void fail_report(const char* kind, const Pending* p, uint32_t got) {
+        mismatches++;
+        if (!first_fail_label) { first_fail_label = p ? p->label : "valid_pipeline"; first_fail_op = checked; }
+        if (!quiet && mismatches <= 8) {
+            if (p) std::printf("MISMATCH[%s] class=%s a=%04x b=%04x acc=%08x  got=%08x  exp=%08x\n",
+                               kind, p->label, p->op.a, p->op.b, p->op.c, got, p->exp.bits);
+            else   std::printf("MISMATCH[%s] out_valid=%d at edge %llu\n", kind, (int)top->out_valid, (unsigned long long)edge_no);
+        }
+    }
+
+    // ---- reset with transactions in flight --------------------------------
+    void reset_in_flight() {
+        for (int i = 0; i < 5; i++) { Op o = gen_op(rng, S_NORMALS); cycle(true, o, "reset_test"); }
+        top->rst_n = 0;
+        q.clear();                                           // in-flight ops are dropped by reset
+        for (int i = 0; i < 3; i++) { Op o = gen_op(rng, S_NORMALS); cycle(false, o, "reset_hold"); }
+        top->rst_n = 1;
+        cov.hit("pipeline", "reset_with_ops_in_flight");
+        drain();
+    }
+
+    Vmac_top* top; Rng& rng; Coverage cov;
+    std::deque<Pending> q;
+    uint64_t edge_no = 0, checked = 0, mismatches = 0, first_fail_op = 0;
+    const char* first_fail_label = nullptr;
+    int run_len = 0, gap_len = 0;
+    bool quiet = false;
+};
+
+static uint64_t plus_u64(int argc, char** argv, const char* key, uint64_t dflt) {
+    size_t n = std::strlen(key);
+    for (int i = 1; i < argc; i++) if (!std::strncmp(argv[i], key, n)) return std::strtoull(argv[i] + n, nullptr, 0);
+    return dflt;
+}
+static bool plus_flag(int argc, char** argv, const char* key) {
+    for (int i = 1; i < argc; i++) if (!std::strcmp(argv[i], key)) return true;
+    return false;
+}
+
+int main(int argc, char** argv) {
+    Verilated::commandArgs(argc, argv);
+    Verilated::fatalOnError(false);                          // count assertion failures instead of aborting
+    uint64_t seed = plus_u64(argc, argv, "+seed=", 1);
+    uint64_t nops = plus_u64(argc, argv, "+ops=", 400000);
+    bool quiet = plus_flag(argc, argv, "+quiet");
+    bool skip_directed = plus_flag(argc, argv, "+skipdirected");   // random phase only (used by mutation report)
+
+    Vmac_top* top = new Vmac_top;
+    Rng rng(seed);
+    Env env(top, rng);
+    env.quiet = quiet;
+
+    // reset
+    top->rst_n = 0; top->in_valid = 0; top->a = 0; top->b = 0; top->acc = 0;
+    for (int i = 0; i < 4; i++) { top->clk = 0; top->eval(); top->clk = 1; top->eval(); }
+    top->rst_n = 1;
+
+    // ---- phase 1: directed - cross product of all special encodings ----------
+    if (!skip_directed) {
+        static const uint16_t SA[] = { 0x0000, 0x8000, 0x7F80, 0xFF80, 0x7FC0, 0xFFC0, 0x7F81, 0xFF81, 0x0001, 0x8001, 0x007F, 0x807F,
+                                       0x0080, 0x8080, 0x7F7F, 0xFF7F, 0x3F80, 0xBF80, 0x4000, 0x3F00, 0x3980, 0x3981, 0x7F00, 0x0100 };
+        static const uint32_t SC[] = { 0x00000000, 0x80000000, 0x7F800000, 0xFF800000, 0x7FC00000, 0xFFC00000, 0x7F800001, 0xFFBFFFFF,
+                                       0x00000001, 0x80000001, 0x007FFFFF, 0x807FFFFF, 0x00800000, 0x80800000, 0x7F7FFFFF, 0xFF7FFFFF,
+                                       0x3F800000, 0xBF800000, 0x3F800001, 0x3FFFFFFF, 0x40000000, 0x00800001 };
+        for (uint16_t a : SA) for (uint16_t b : SA) for (uint32_t c : SC) env.cycle(true, Op{ a, b, c }, "directed_specials");
+        env.drain();
+    }
+
+    // ---- phase 2: every possible bf16 value on each multiplier input ---------
+    for (uint32_t i = 0; !skip_directed && i < 65536; i++) {
+        Op o = gen_op(rng, S_NORMALS); o.a = (uint16_t)i; if (rng.chance(30)) o.c = ref::f2u(0.0f) | (rng.u32() & 0x80000000u);
+        env.cycle(true, o, "exhaustive_a");
+    }
+    for (uint32_t i = 0; !skip_directed && i < 65536; i++) {
+        Op o = gen_op(rng, S_NORMALS); o.b = (uint16_t)i;
+        env.cycle(true, o, "exhaustive_b");
+    }
+    env.drain();
+
+    // ---- phase 3: constrained-random, all classes, random valid gaps ---------
+    int gap_mode_len = 0, valid_pct = 100;
+    for (uint64_t i = 0; i < nops; i++) {
+        if (gap_mode_len-- <= 0) {                           // switch traffic pattern now and then
+            static const int pcts[] = { 100, 100, 70, 30, 100, 10 };
+            valid_pct = pcts[rng.below(6)]; gap_mode_len = rng.range(8, 200);
+        }
+        if (!rng.chance(valid_pct)) { env.idle(); continue; }
+        int cls = (int)rng.below(S_NUM_CLASSES);
+        env.cycle(true, gen_op(rng, cls), STIM_NAMES[cls]);
+        if (i % 100000 == 99999) env.reset_in_flight();      // occasional reset with ops in flight
+    }
+    env.drain();
+    env.reset_in_flight();
+
+    // ---- report -----------------------------------------------------------
+    int asserts = Verilated::threadContextp()->errorCount();
+    std::printf("\nops checked      : %llu\n", (unsigned long long)env.checked);
+    std::printf("scoreboard fails : %llu\n", (unsigned long long)env.mismatches);
+    std::printf("assertion fails  : %d\n", asserts);
+    if (env.mismatches) std::printf("first failure    : after %llu good results, caught by stimulus class '%s'\n",
+                                    (unsigned long long)env.first_fail_op, env.first_fail_label);
+    double pct = env.cov.report(stdout, plus_flag(argc, argv, "+covverbose"));
+    bool pass = env.mismatches == 0 && asserts == 0;
+    std::printf("\n%s  (seed=%llu, functional coverage %.1f%%)\n", pass ? "TEST PASSED" : "TEST FAILED",
+                (unsigned long long)seed, pct);
+
+    top->final();
+#if VM_COVERAGE
+    VerilatedCov::write("coverage.dat");
+#endif
+    delete top;
+    return pass ? 0 : 1;
+}
